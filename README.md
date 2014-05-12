@@ -1,4 +1,4 @@
-## A bower build for https://github.com/mozilla/pdf.js
+## A bower build for [mozilla/pdf.js](https://github.com/mozilla/pdf).js
 
 ### Usage
 
