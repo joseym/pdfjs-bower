@@ -1,6 +1,6 @@
 {
   "name": "pdfjs-bower",
-  "version": "0.0.1",
+  "version": "1.0.180",
   "description": "PDF.JS bower build",
   "main": "app.js",
   "scripts": {
