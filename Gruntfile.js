@@ -9,17 +9,17 @@ module.exports = function (grunt) {
     execute: {
       generic: {
         options: {
-          cwd: 'pdf.js',
+          cwd: 'pdfjs',
           args: ['generic']
         },
-        src: ['pdf.js/make.js']
+        src: ['pdfjs/make.js']
       }
     },
     copy: {
       pdfjs: {
         files: [
           // includes files within path
-          { expand: true, flatten: true, src: ['pdf.js/build/pdf.js', 'pdf.js/build/pdf.worker.js', 'pdf.js/build/generic/web/compatibility.js'], dest: 'dist/', filter: 'isFile'},
+          { expand: true, flatten: true, src: ['pdfjs/build/pdf.js', 'pdfjs/build/pdf.worker.js', 'pdfjs/build/generic/web/compatibility.js'], dest: 'dist/', filter: 'isFile'},
         ]
       }
     }
