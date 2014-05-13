@@ -26,6 +26,7 @@ You can build yourself by doing the following
 > In your terminal please navigate to where the project is cloned
 
 - `cd pdfjs-bower`
+- `npm install -d`
 - `grunt`
 
 > You should now see 3 files within the `dist` directory
