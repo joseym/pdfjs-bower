@@ -14,7 +14,7 @@ __Enjoy__
 ---
 
 ### Updating or building manually
-Currently the build is for pdf.js `v1.0.194`.
+Currently the build is for pdf.js `v1.0.233`.
 You can build yourself by doing the following
 
 ##### Prepping (getting pdf.js)
