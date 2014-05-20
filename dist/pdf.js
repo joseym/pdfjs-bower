@@ -21,8 +21,8 @@ if (typeof PDFJS === 'undefined') {
   (typeof window !== 'undefined' ? window : this).PDFJS = {};
 }
 
-PDFJS.version = '1.0.194';
-PDFJS.build = '36c6bc2';
+PDFJS.version = '1.0.233';
+PDFJS.build = 'd39af0a';
 
 (function pdfjsWrapper() {
   // Use strict in our context only - users might not want it
@@ -1447,7 +1447,7 @@ function MessageHandler(name, comObj) {
   this.comObj = comObj;
   this.callbackIndex = 1;
   this.postMessageTransfers = true;
-  var callbacks = this.callbacks = {};
+  var callbacksCapabilities = this.callbacksCapabilities = {};
   var ah = this.actionHandler = {};
 
   ah['console_log'] = [function ahConsoleLog(data) {
@@ -1464,35 +1464,40 @@ function MessageHandler(name, comObj) {
     var data = event.data;
     if (data.isReply) {
       var callbackId = data.callbackId;
-      if (data.callbackId in callbacks) {
-        var callback = callbacks[callbackId];
-        delete callbacks[callbackId];
-        callback(data.data);
+      if (data.callbackId in callbacksCapabilities) {
+        var callback = callbacksCapabilities[callbackId];
+        delete callbacksCapabilities[callbackId];
+        if ('error' in data) {
+          callback.reject(data.error);
+        } else {
+          callback.resolve(data.data);
+        }
       } else {
         error('Cannot resolve callback ' + callbackId);
       }
     } else if (data.action in ah) {
       var action = ah[data.action];
       if (data.callbackId) {
-        var deferred = {};
-        var promise = new Promise(function (resolve, reject) {
-          deferred.resolve = resolve;
-          deferred.reject = reject;
-        });
-        deferred.promise = promise;
-        promise.then(function(resolvedData) {
+        Promise.resolve().then(function () {
+          return action[0].call(action[1], data.data);
+        }).then(function (result) {
           comObj.postMessage({
             isReply: true,
             callbackId: data.callbackId,
-            data: resolvedData
+            data: result
+          });
+        }, function (reason) {
+          comObj.postMessage({
+            isReply: true,
+            callbackId: data.callbackId,
+            error: reason
           });
         });
-        action[0].call(action[1], data.data, deferred);
       } else {
         action[0].call(action[1], data.data);
       }
     } else {
-      error('Unkown action from worker: ' + data.action);
+      error('Unknown action from worker: ' + data.action);
     }
   };
 }
@@ -1509,19 +1514,47 @@ MessageHandler.prototype = {
    * Sends a message to the comObj to invoke the action with the supplied data.
    * @param {String} actionName Action to call.
    * @param {JSON} data JSON data to send.
-   * @param {function} [callback] Optional callback that will handle a reply.
    * @param {Array} [transfers] Optional list of transfers/ArrayBuffers
    */
-  send: function messageHandlerSend(actionName, data, callback, transfers) {
+  send: function messageHandlerSend(actionName, data, transfers) {
     var message = {
       action: actionName,
       data: data
     };
-    if (callback) {
-      var callbackId = this.callbackIndex++;
-      this.callbacks[callbackId] = callback;
-      message.callbackId = callbackId;
+    this.postMessage(message, transfers);
+  },
+  /**
+   * Sends a message to the comObj to invoke the action with the supplied data.
+   * Expects that other side will callback with the response.
+   * @param {String} actionName Action to call.
+   * @param {JSON} data JSON data to send.
+   * @param {Array} [transfers] Optional list of transfers/ArrayBuffers.
+   * @returns {Promise} Promise to be resolved with response data.
+   */
+  sendWithPromise:
+    function messageHandlerSendWithPromise(actionName, data, transfers) {
+    var callbackId = this.callbackIndex++;
+    var message = {
+      action: actionName,
+      data: data,
+      callbackId: callbackId
+    };
+    var capability = createPromiseCapability();
+    this.callbacksCapabilities[callbackId] = capability;
+    try {
+      this.postMessage(message, transfers);
+    } catch (e) {
+      capability.reject(e);
     }
+    return capability.promise;
+  },
+  /**
+   * Sends raw message to the comObj.
+   * @private
+   * @param message {Object} Raw message.
+   * @param transfers List of transfers/ArrayBuffers, or undefined.
+   */
+  postMessage: function (message, transfers) {
     if (transfers && this.postMessageTransfers) {
       this.comObj.postMessage(message, transfers);
     } else {
@@ -1916,6 +1949,7 @@ var AlternateCS = (function AlternateCSClosure() {
     getRgbBuffer: function AlternateCS_getRgbBuffer(src, srcOffset, count,
                                                     dest, destOffset, bits,
                                                     alpha01) {
+      var tinted;
       var tintFn = this.tintFn;
       var base = this.base;
       var scale = 1 / ((1 << bits) - 1);
@@ -1929,16 +1963,22 @@ var AlternateCS = (function AlternateCSClosure() {
 
       var scaled = new Float32Array(numComps);
       var i, j;
-      for (i = 0; i < count; i++) {
-        for (j = 0; j < numComps; j++) {
-          scaled[j] = src[srcOffset++] * scale;
-        }
-        var tinted = tintFn(scaled);
-        if (usesZeroToOneRange) {
+      if (usesZeroToOneRange) {
+        for (i = 0; i < count; i++) {
+          for (j = 0; j < numComps; j++) {
+            scaled[j] = src[srcOffset++] * scale;
+          }
+          tinted = tintFn(scaled);
           for (j = 0; j < baseNumComps; j++) {
             baseBuf[pos++] = tinted[j] * 255;
           }
-        } else {
+        }
+      } else {
+        for (i = 0; i < count; i++) {
+          for (j = 0; j < numComps; j++) {
+            scaled[j] = src[srcOffset++] * scale;
+          }
+          tinted = tintFn(scaled);
           base.getRgbItem(tinted, 0, baseBuf, pos);
           pos += baseNumComps;
         }
@@ -2818,64 +2858,55 @@ var PDFFunction = (function PDFFunctionClosure() {
       var domain = IR[1];
       var range = IR[2];
       var code = IR[3];
-      var numOutputs = range.length / 2;
+      var numOutputs = range.length >> 1;
+      var numInputs = domain.length >> 1;
       var evaluator = new PostScriptEvaluator(code);
       // Cache the values for a big speed up, the cache size is limited though
       // since the number of possible values can be huge from a PS function.
-      var cache = new FunctionCache();
+      var cache = {};
+      // The MAX_CACHE_SIZE is set to ~4x the maximum number of distinct values
+      // seen in our tests.
+      var MAX_CACHE_SIZE = 2048 * 4;
+      var cache_available = MAX_CACHE_SIZE;
       return function constructPostScriptFromIRResult(args) {
-        var initialStack = [];
-        for (var i = 0, ii = (domain.length / 2); i < ii; ++i) {
-          initialStack.push(args[i]);
+        var i, value;
+        var key = '';
+        var input = new Array(numInputs);
+        for (i = 0; i < numInputs; i++) {
+          value = args[i];
+          input[i] = value;
+          key += value + '_';
         }
 
-        var key = initialStack.join('_');
-        if (cache.has(key)) {
-          return cache.get(key);
+        var cachedValue = cache[key];
+        if (cachedValue !== undefined) {
+          return cachedValue;
         }
 
-        var stack = evaluator.execute(initialStack);
-        var transformed = [];
-        for (i = numOutputs - 1; i >= 0; --i) {
-          var out = stack.pop();
-          var rangeIndex = 2 * i;
-          if (out < range[rangeIndex]) {
-            out = range[rangeIndex];
-          } else if (out > range[rangeIndex + 1]) {
-            out = range[rangeIndex + 1];
+        var output = new Array(numOutputs);
+        var stack = evaluator.execute(input);
+        var stackIndex = stack.length - numOutputs;
+        for (i = 0; i < numOutputs; i++) {
+          value = stack[stackIndex + i];
+          var bound = range[i * 2];
+          if (value < bound) {
+            value = bound;
+          } else {
+            bound = range[i * 2 +1];
+            if (value > bound) {
+              value = bound;
+            }
           }
-          transformed[i] = out;
+          output[i] = value;
         }
-        cache.set(key, transformed);
-        return transformed;
+        if (cache_available > 0) {
+          cache_available--;
+          cache[key] = output;
+        }
+        return output;
       };
     }
   };
-})();
-
-var FunctionCache = (function FunctionCacheClosure() {
-  // Of 10 PDF's with type4 functions the maxium number of distinct values seen
-  // was 256. This still may need some tweaking in the future though.
-  var MAX_CACHE_SIZE = 1024;
-  function FunctionCache() {
-    this.cache = {};
-    this.total = 0;
-  }
-  FunctionCache.prototype = {
-    has: function FunctionCache_has(key) {
-      return key in this.cache;
-    },
-    get: function FunctionCache_get(key) {
-      return this.cache[key];
-    },
-    set: function FunctionCache_set(key, value) {
-      if (this.total < MAX_CACHE_SIZE) {
-        this.cache[key] = value;
-        this.total++;
-      }
-    }
-  };
-  return FunctionCache;
 })();
 
 var PostScriptStack = (function PostScriptStackClosure() {
@@ -3363,11 +3394,9 @@ var Annotation = (function AnnotationClosure() {
     },
 
     getOperatorList: function Annotation_getOperatorList(evaluator) {
-      var capability = createPromiseCapability();
 
       if (!this.appearance) {
-        capability.resolve(new OperatorList());
-        return capability.promise;
+        return Promise.resolve(new OperatorList());
       }
 
       var data = this.data;
@@ -3386,18 +3415,18 @@ var Annotation = (function AnnotationClosure() {
       var bbox = appearanceDict.get('BBox') || [0, 0, 1, 1];
       var matrix = appearanceDict.get('Matrix') || [1, 0, 0, 1, 0 ,0];
       var transform = getTransformMatrix(data.rect, bbox, matrix);
+      var self = this;
 
-      resourcesPromise.then(function(resources) {
-        var opList = new OperatorList();
-        opList.addOp(OPS.beginAnnotation, [data.rect, transform, matrix]);
-        evaluator.getOperatorList(this.appearance, resources, opList);
-        opList.addOp(OPS.endAnnotation, []);
-        capability.resolve(opList);
-
-        this.appearance.reset();
-      }.bind(this), capability.reject);
-
-      return capability.promise;
+      return resourcesPromise.then(function(resources) {
+          var opList = new OperatorList();
+          opList.addOp(OPS.beginAnnotation, [data.rect, transform, matrix]);
+          return evaluator.getOperatorList(self.appearance, resources, opList).
+            then(function () {
+              opList.addOp(OPS.endAnnotation, []);
+              self.appearance.reset();
+              return opList;
+            });
+        });
     }
   };
 
@@ -3656,8 +3685,10 @@ var TextWidgetAnnotation = (function TextWidgetAnnotationClosure() {
       }
 
       var stream = new Stream(stringToBytes(data.defaultAppearance));
-      evaluator.getOperatorList(stream, this.fieldResources, opList);
-      return Promise.resolve(opList);
+      return evaluator.getOperatorList(stream, this.fieldResources, opList).
+        then(function () {
+          return opList;
+        });
     }
   });
 
@@ -4253,9 +4284,7 @@ var PDFDocumentProxy = (function PDFDocumentProxyClosure() {
      * the raw data from the PDF.
      */
     getData: function PDFDocumentProxy_getData() {
-      var capability = createPromiseCapability();
-      this.transport.getData(capability);
-      return capability.promise;
+      return this.transport.getData();
     },
     /**
      * @return {Promise} A promise that is resolved when the document's data
@@ -4334,7 +4363,8 @@ var PDFDocumentProxy = (function PDFDocumentProxyClosure() {
  * @class
  */
 var PDFPageProxy = (function PDFPageProxyClosure() {
-  function PDFPageProxy(pageInfo, transport) {
+  function PDFPageProxy(pageIndex, pageInfo, transport) {
+    this.pageIndex = pageIndex;
     this.pageInfo = pageInfo;
     this.transport = transport;
     this.stats = new StatTimer();
@@ -4350,7 +4380,7 @@ var PDFPageProxy = (function PDFPageProxyClosure() {
      * @return {number} Page number of the page. First page is 1.
      */
     get pageNumber() {
-      return this.pageInfo.pageIndex + 1;
+      return this.pageIndex + 1;
     },
     /**
      * @return {number} The number of degrees the page is rotated clockwise.
@@ -4390,14 +4420,13 @@ var PDFPageProxy = (function PDFPageProxyClosure() {
      * annotation objects.
      */
     getAnnotations: function PDFPageProxy_getAnnotations() {
-      if (this.annotationsCapability) {
-        return this.annotationsCapability.promise;
+      if (this.annotationsPromise) {
+        return this.annotationsPromise;
       }
 
-      var capability = createPromiseCapability();
-      this.annotationsCapability = capability;
-      this.transport.getAnnotations(this.pageInfo.pageIndex);
-      return capability.promise;
+      var promise = this.transport.getAnnotations(this.pageIndex);
+      this.annotationsPromise = promise;
+      return promise;
     },
     /**
      * Begins the process of rendering a page to the desired context.
@@ -4493,15 +4522,9 @@ var PDFPageProxy = (function PDFPageProxyClosure() {
      * object that represent the page text content.
      */
     getTextContent: function PDFPageProxy_getTextContent() {
-      return new Promise(function (resolve) {
-        this.transport.messageHandler.send('GetTextContent', {
-            pageIndex: this.pageNumber - 1
-          },
-          function textContentCallback(textContent) {
-            resolve(textContent);
-          }
-        );
-      }.bind(this));
+      return this.transport.messageHandler.sendWithPromise('GetTextContent', {
+        pageIndex: this.pageNumber - 1
+      });
     },
     /**
      * Destroys resources allocated by the page.
@@ -4529,6 +4552,7 @@ var PDFPageProxy = (function PDFPageProxyClosure() {
         delete this.intentStates[intent];
       }, this);
       this.objs.clear();
+      this.annotationsPromise = null;
       this.pendingDestroy = false;
     },
     /**
@@ -4584,7 +4608,7 @@ var WorkerTransport = (function WorkerTransportClosure() {
     this.commonObjs = new PDFObjects();
 
     this.pageCache = [];
-    this.pageCapabilities = [];
+    this.pagePromises = [];
     this.downloadInfoCapability = createPromiseCapability();
     this.passwordCallback = null;
 
@@ -4629,7 +4653,7 @@ var WorkerTransport = (function WorkerTransportClosure() {
         // Some versions of Opera throw a DATA_CLONE_ERR on serializing the
         // typed array. Also, checking if we can use transfers.
         try {
-          messageHandler.send('test', testObj, null, [testObj.buffer]);
+          messageHandler.send('test', testObj, [testObj.buffer]);
         } catch (ex) {
           info('Cannot use postMessage transfers');
           testObj[0] = 0;
@@ -4652,9 +4676,9 @@ var WorkerTransport = (function WorkerTransportClosure() {
   WorkerTransport.prototype = {
     destroy: function WorkerTransport_destroy() {
       this.pageCache = [];
-      this.pageCapabilities = [];
+      this.pagePromises = [];
       var self = this;
-      this.messageHandler.send('Terminate', null, function () {
+      this.messageHandler.sendWithPromise('Terminate', null).then(function () {
         FontLoader.clear();
         if (self.worker) {
           self.worker.terminate();
@@ -4774,20 +4798,6 @@ var WorkerTransport = (function WorkerTransportClosure() {
         this.downloadInfoCapability.resolve(data);
       }, this);
 
-      messageHandler.on('GetPage', function transportPage(data) {
-        var pageInfo = data.pageInfo;
-        var page = new PDFPageProxy(pageInfo, this);
-        this.pageCache[pageInfo.pageIndex] = page;
-        var promise = this.pageCapabilities[pageInfo.pageIndex];
-        promise.resolve(page);
-      }, this);
-
-      messageHandler.on('GetAnnotations', function transportAnnotations(data) {
-        var annotations = data.annotations;
-        var promise = this.pageCache[data.pageIndex].annotationsCapability;
-        promise.resolve(annotations);
-      }, this);
-
       messageHandler.on('StartRenderPage', function transportRender(data) {
         var page = this.pageCache[data.pageIndex];
 
@@ -4881,9 +4891,9 @@ var WorkerTransport = (function WorkerTransportClosure() {
         this.workerReadyCapability.reject(data);
       }, this);
 
-      messageHandler.on('PageError', function transportError(data, intent) {
+      messageHandler.on('PageError', function transportError(data) {
         var page = this.pageCache[data.pageNum - 1];
-        var intentState = page.intentStates[intent];
+        var intentState = page.intentStates[data.intent];
         if (intentState.displayReadyCapability.promise) {
           intentState.displayReadyCapability.reject(data.error);
         } else {
@@ -4891,40 +4901,46 @@ var WorkerTransport = (function WorkerTransportClosure() {
         }
       }, this);
 
-      messageHandler.on('JpegDecode', function(data, deferred) {
+      messageHandler.on('JpegDecode', function(data) {
         var imageUrl = data[0];
         var components = data[1];
         if (components != 3 && components != 1) {
-          error('Only 3 component or 1 component can be returned');
+          return Promise.reject(
+            new Error('Only 3 components or 1 component can be returned'));
         }
 
-        var img = new Image();
-        img.onload = (function messageHandler_onloadClosure() {
-          var width = img.width;
-          var height = img.height;
-          var size = width * height;
-          var rgbaLength = size * 4;
-          var buf = new Uint8Array(size * components);
-          var tmpCanvas = createScratchCanvas(width, height);
-          var tmpCtx = tmpCanvas.getContext('2d');
-          tmpCtx.drawImage(img, 0, 0);
-          var data = tmpCtx.getImageData(0, 0, width, height).data;
-          var i, j;
+        return new Promise(function (resolve, reject) {
+          var img = new Image();
+          img.onload = function () {
+            var width = img.width;
+            var height = img.height;
+            var size = width * height;
+            var rgbaLength = size * 4;
+            var buf = new Uint8Array(size * components);
+            var tmpCanvas = createScratchCanvas(width, height);
+            var tmpCtx = tmpCanvas.getContext('2d');
+            tmpCtx.drawImage(img, 0, 0);
+            var data = tmpCtx.getImageData(0, 0, width, height).data;
+            var i, j;
 
-          if (components == 3) {
-            for (i = 0, j = 0; i < rgbaLength; i += 4, j += 3) {
-              buf[j] = data[i];
-              buf[j + 1] = data[i + 1];
-              buf[j + 2] = data[i + 2];
+            if (components == 3) {
+              for (i = 0, j = 0; i < rgbaLength; i += 4, j += 3) {
+                buf[j] = data[i];
+                buf[j + 1] = data[i + 1];
+                buf[j + 2] = data[i + 2];
+              }
+            } else if (components == 1) {
+              for (i = 0, j = 0; i < rgbaLength; i += 4, j++) {
+                buf[j] = data[i];
+              }
             }
-          } else if (components == 1) {
-            for (i = 0, j = 0; i < rgbaLength; i += 4, j++) {
-              buf[j] = data[i];
-            }
-          }
-          deferred.resolve({ data: buf, width: width, height: height});
-        }).bind(this);
-        img.src = imageUrl;
+            resolve({ data: buf, width: width, height: height});
+          };
+          img.onerror = function () {
+            reject(new Error('JpegDecode failed to load image'));
+          };
+          img.src = imageUrl;
+        });
       });
     },
 
@@ -4943,10 +4959,8 @@ var WorkerTransport = (function WorkerTransportClosure() {
       });
     },
 
-    getData: function WorkerTransport_getData(capability) {
-      this.messageHandler.send('GetData', null, function(data) {
-        capability.resolve(data);
-      });
+    getData: function WorkerTransport_getData() {
+      return this.messageHandler.sendWithPromise('GetData', null);
     },
 
     getPage: function WorkerTransport_getPage(pageNumber, capability) {
@@ -4956,96 +4970,67 @@ var WorkerTransport = (function WorkerTransportClosure() {
       }
 
       var pageIndex = pageNumber - 1;
-      if (pageIndex in this.pageCapabilities) {
-        return this.pageCapabilities[pageIndex].promise;
+      if (pageIndex in this.pagePromises) {
+        return this.pagePromises[pageIndex];
       }
-      capability = createPromiseCapability();
-      this.pageCapabilities[pageIndex] = capability;
-      this.messageHandler.send('GetPageRequest', { pageIndex: pageIndex });
-      return capability.promise;
+      var promise = this.messageHandler.sendWithPromise('GetPage', {
+        pageIndex: pageIndex
+      }).then(function (pageInfo) {
+        var page = new PDFPageProxy(pageIndex, pageInfo, this);
+        this.pageCache[pageIndex] = page;
+        return page;
+      }.bind(this));
+      this.pagePromises[pageIndex] = promise;
+      return promise;
     },
 
     getPageIndex: function WorkerTransport_getPageIndexByRef(ref) {
-      return new Promise(function (resolve) {
-        this.messageHandler.send('GetPageIndex', { ref: ref },
-          function (pageIndex) {
-            resolve(pageIndex);
-          }
-        );
-      }.bind(this));
+      return this.messageHandler.sendWithPromise('GetPageIndex', { ref: ref });
     },
 
     getAnnotations: function WorkerTransport_getAnnotations(pageIndex) {
-      this.messageHandler.send('GetAnnotationsRequest',
+      return this.messageHandler.sendWithPromise('GetAnnotations',
         { pageIndex: pageIndex });
     },
 
     getDestinations: function WorkerTransport_getDestinations() {
-      return new Promise(function (resolve) {
-        this.messageHandler.send('GetDestinations', null,
-          function transportDestinations(destinations) {
-            resolve(destinations);
-          }
-        );
-      }.bind(this));
+      return this.messageHandler.sendWithPromise('GetDestinations', null);
     },
 
     getAttachments: function WorkerTransport_getAttachments() {
-      return new Promise(function (resolve) {
-        this.messageHandler.send('GetAttachments', null,
-          function transportAttachments(attachments) {
-            resolve(attachments);
-          }
-        );
-      }.bind(this));
+      return this.messageHandler.sendWithPromise('GetAttachments', null);
     },
 
     getJavaScript: function WorkerTransport_getJavaScript() {
-      return new Promise(function (resolve) {
-        this.messageHandler.send('GetJavaScript', null,
-          function transportJavaScript(js) {
-            resolve(js);
-          }
-        );
-      }.bind(this));
+      return this.messageHandler.sendWithPromise('GetJavaScript', null);
     },
 
     getOutline: function WorkerTransport_getOutline() {
-      return new Promise(function (resolve) {
-        this.messageHandler.send('GetOutline', null,
-          function transportOutline(outline) {
-            resolve(outline);
-          }
-        );
-      }.bind(this));
+      return this.messageHandler.sendWithPromise('GetOutline', null);
     },
 
     getMetadata: function WorkerTransport_getMetadata() {
-      return new Promise(function (resolve) {
-        this.messageHandler.send('GetMetadata', null,
-          function transportMetadata(results) {
-            resolve({
-              info: results[0],
-              metadata: (results[1] ? new PDFJS.Metadata(results[1]) : null)
-            });
-          }
-        );
-      }.bind(this));
+      return this.messageHandler.sendWithPromise('GetMetadata', null).
+        then(function transportMetadata(results) {
+        return {
+          info: results[0],
+          metadata: (results[1] ? new PDFJS.Metadata(results[1]) : null)
+        };
+      });
     },
 
     startCleanup: function WorkerTransport_startCleanup() {
-      this.messageHandler.send('Cleanup', null,
-        function endCleanup() {
-          for (var i = 0, ii = this.pageCache.length; i < ii; i++) {
-            var page = this.pageCache[i];
-            if (page) {
-              page.destroy();
-            }
+      this.messageHandler.sendWithPromise('Cleanup', null).
+        then(function endCleanup() {
+        for (var i = 0, ii = this.pageCache.length; i < ii; i++) {
+          var page = this.pageCache[i];
+          if (page) {
+            page.destroy();
           }
-          this.commonObjs.clear();
-          FontLoader.clear();
-        }.bind(this)
-      );
+        }
+        this.commonObjs.clear();
+        FontLoader.clear();
+      }.bind(this));
     }
   };
   return WorkerTransport;
@@ -6356,10 +6341,10 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
             ctx.lineTo(x, y);
             break;
           case OPS.curveTo:
-            ctx.bezierCurveTo(args[j], args[j + 1], args[j + 2], args[j + 3],
-                              args[j + 4], args[j + 5]);
             x = args[j + 4];
             y = args[j + 5];
+            ctx.bezierCurveTo(args[j], args[j + 1], args[j + 2], args[j + 3],
+                              x, y);
             j += 6;
             break;
           case OPS.curveTo2:
@@ -6370,10 +6355,9 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
             j += 4;
             break;
           case OPS.curveTo3:
-            ctx.bezierCurveTo(args[j], args[j + 1], args[j + 2], args[j + 3],
-                              args[j + 2], args[j + 3]);
             x = args[j + 2];
             y = args[j + 3];
+            ctx.bezierCurveTo(args[j], args[j + 1], x, y, x, y);
             j += 4;
             break;
           case OPS.closePath:
@@ -6441,21 +6425,21 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
       }
 
       if (this.pendingEOFill) {
-        if ('mozFillRule' in this.ctx) {
-          this.ctx.mozFillRule = 'evenodd';
-          this.ctx.fill();
-          this.ctx.mozFillRule = 'nonzero';
+        if (ctx.mozFillRule !== undefined) {
+          ctx.mozFillRule = 'evenodd';
+          ctx.fill();
+          ctx.mozFillRule = 'nonzero';
         } else {
           try {
-            this.ctx.fill('evenodd');
+            ctx.fill('evenodd');
           } catch (ex) {
             // shouldn't really happen, but browsers might think differently
-            this.ctx.fill();
+            ctx.fill();
           }
         }
         this.pendingEOFill = false;
       } else {
-        this.ctx.fill();
+        ctx.fill();
       }
 
       if (needRestore) {
@@ -6507,12 +6491,12 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
       this.current.y = this.current.lineY = 0;
     },
     endText: function CanvasGraphics_endText() {
-      if (!('pendingTextPaths' in this)) {
-        this.ctx.beginPath();
-        return;
-      }
       var paths = this.pendingTextPaths;
       var ctx = this.ctx;
+      if (paths === undefined) {
+        ctx.beginPath();
+        return;
+      }
 
       ctx.save();
       ctx.beginPath();
@@ -6626,7 +6610,7 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
       }
     },
 
-    paintChar: function (character, x, y) {
+    paintChar: function CanvasGraphics_paintChar(character, x, y) {
       var ctx = this.ctx;
       var current = this.current;
       var font = current.font;
@@ -7176,7 +7160,7 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
       this.ctx = this.groupStack.pop();
       // Turn off image smoothing to avoid sub pixel interpolation which can
       // look kind of blurry for some pdfs.
-      if ('imageSmoothingEnabled' in this.ctx) {
+      if (this.ctx.imageSmoothingEnabled !== undefined) {
         this.ctx.imageSmoothingEnabled = false;
       } else {
         this.ctx.mozImageSmoothingEnabled = false;
@@ -7518,26 +7502,27 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
     // Helper functions
 
     consumePath: function CanvasGraphics_consumePath() {
+      var ctx = this.ctx;
       if (this.pendingClip) {
         if (this.pendingClip == EO_CLIP) {
-          if ('mozFillRule' in this.ctx) {
-            this.ctx.mozFillRule = 'evenodd';
-            this.ctx.clip();
-            this.ctx.mozFillRule = 'nonzero';
+          if (ctx.mozFillRule !== undefined) {
+            ctx.mozFillRule = 'evenodd';
+            ctx.clip();
+            ctx.mozFillRule = 'nonzero';
           } else {
             try {
-              this.ctx.clip('evenodd');
+              ctx.clip('evenodd');
             } catch (ex) {
               // shouldn't really happen, but browsers might think differently
-              this.ctx.clip();
+              ctx.clip();
             }
           }
         } else {
-          this.ctx.clip();
+          ctx.clip();
         }
         this.pendingClip = null;
       }
-      this.ctx.beginPath();
+      ctx.beginPath();
     },
     getSinglePixelWidth: function CanvasGraphics_getSinglePixelWidth(scale) {
       var inverse = this.ctx.mozCurrentTransformInverse;

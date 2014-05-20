@@ -21,8 +21,8 @@ if (typeof PDFJS === 'undefined') {
   (typeof window !== 'undefined' ? window : this).PDFJS = {};
 }
 
-PDFJS.version = '1.0.194';
-PDFJS.build = '36c6bc2';
+PDFJS.version = '1.0.233';
+PDFJS.build = 'd39af0a';
 
 (function pdfjsWrapper() {
   // Use strict in our context only - users might not want it
@@ -1447,7 +1447,7 @@ function MessageHandler(name, comObj) {
   this.comObj = comObj;
   this.callbackIndex = 1;
   this.postMessageTransfers = true;
-  var callbacks = this.callbacks = {};
+  var callbacksCapabilities = this.callbacksCapabilities = {};
   var ah = this.actionHandler = {};
 
   ah['console_log'] = [function ahConsoleLog(data) {
@@ -1464,35 +1464,40 @@ function MessageHandler(name, comObj) {
     var data = event.data;
     if (data.isReply) {
       var callbackId = data.callbackId;
-      if (data.callbackId in callbacks) {
-        var callback = callbacks[callbackId];
-        delete callbacks[callbackId];
-        callback(data.data);
+      if (data.callbackId in callbacksCapabilities) {
+        var callback = callbacksCapabilities[callbackId];
+        delete callbacksCapabilities[callbackId];
+        if ('error' in data) {
+          callback.reject(data.error);
+        } else {
+          callback.resolve(data.data);
+        }
       } else {
         error('Cannot resolve callback ' + callbackId);
       }
     } else if (data.action in ah) {
       var action = ah[data.action];
       if (data.callbackId) {
-        var deferred = {};
-        var promise = new Promise(function (resolve, reject) {
-          deferred.resolve = resolve;
-          deferred.reject = reject;
-        });
-        deferred.promise = promise;
-        promise.then(function(resolvedData) {
+        Promise.resolve().then(function () {
+          return action[0].call(action[1], data.data);
+        }).then(function (result) {
           comObj.postMessage({
             isReply: true,
             callbackId: data.callbackId,
-            data: resolvedData
+            data: result
+          });
+        }, function (reason) {
+          comObj.postMessage({
+            isReply: true,
+            callbackId: data.callbackId,
+            error: reason
           });
         });
-        action[0].call(action[1], data.data, deferred);
       } else {
         action[0].call(action[1], data.data);
       }
     } else {
-      error('Unkown action from worker: ' + data.action);
+      error('Unknown action from worker: ' + data.action);
     }
   };
 }
@@ -1509,19 +1514,47 @@ MessageHandler.prototype = {
    * Sends a message to the comObj to invoke the action with the supplied data.
    * @param {String} actionName Action to call.
    * @param {JSON} data JSON data to send.
-   * @param {function} [callback] Optional callback that will handle a reply.
    * @param {Array} [transfers] Optional list of transfers/ArrayBuffers
    */
-  send: function messageHandlerSend(actionName, data, callback, transfers) {
+  send: function messageHandlerSend(actionName, data, transfers) {
     var message = {
       action: actionName,
       data: data
     };
-    if (callback) {
-      var callbackId = this.callbackIndex++;
-      this.callbacks[callbackId] = callback;
-      message.callbackId = callbackId;
+    this.postMessage(message, transfers);
+  },
+  /**
+   * Sends a message to the comObj to invoke the action with the supplied data.
+   * Expects that other side will callback with the response.
+   * @param {String} actionName Action to call.
+   * @param {JSON} data JSON data to send.
+   * @param {Array} [transfers] Optional list of transfers/ArrayBuffers.
+   * @returns {Promise} Promise to be resolved with response data.
+   */
+  sendWithPromise:
+    function messageHandlerSendWithPromise(actionName, data, transfers) {
+    var callbackId = this.callbackIndex++;
+    var message = {
+      action: actionName,
+      data: data,
+      callbackId: callbackId
+    };
+    var capability = createPromiseCapability();
+    this.callbacksCapabilities[callbackId] = capability;
+    try {
+      this.postMessage(message, transfers);
+    } catch (e) {
+      capability.reject(e);
     }
+    return capability.promise;
+  },
+  /**
+   * Sends raw message to the comObj.
+   * @private
+   * @param message {Object} Raw message.
+   * @param transfers List of transfers/ArrayBuffers, or undefined.
+   */
+  postMessage: function (message, transfers) {
     if (transfers && this.postMessageTransfers) {
       this.comObj.postMessage(message, transfers);
     } else {
@@ -1916,6 +1949,7 @@ var AlternateCS = (function AlternateCSClosure() {
     getRgbBuffer: function AlternateCS_getRgbBuffer(src, srcOffset, count,
                                                     dest, destOffset, bits,
                                                     alpha01) {
+      var tinted;
       var tintFn = this.tintFn;
       var base = this.base;
       var scale = 1 / ((1 << bits) - 1);
@@ -1929,16 +1963,22 @@ var AlternateCS = (function AlternateCSClosure() {
 
       var scaled = new Float32Array(numComps);
       var i, j;
-      for (i = 0; i < count; i++) {
-        for (j = 0; j < numComps; j++) {
-          scaled[j] = src[srcOffset++] * scale;
-        }
-        var tinted = tintFn(scaled);
-        if (usesZeroToOneRange) {
+      if (usesZeroToOneRange) {
+        for (i = 0; i < count; i++) {
+          for (j = 0; j < numComps; j++) {
+            scaled[j] = src[srcOffset++] * scale;
+          }
+          tinted = tintFn(scaled);
           for (j = 0; j < baseNumComps; j++) {
             baseBuf[pos++] = tinted[j] * 255;
           }
-        } else {
+        }
+      } else {
+        for (i = 0; i < count; i++) {
+          for (j = 0; j < numComps; j++) {
+            scaled[j] = src[srcOffset++] * scale;
+          }
+          tinted = tintFn(scaled);
           base.getRgbItem(tinted, 0, baseBuf, pos);
           pos += baseNumComps;
         }
@@ -2818,64 +2858,55 @@ var PDFFunction = (function PDFFunctionClosure() {
       var domain = IR[1];
       var range = IR[2];
       var code = IR[3];
-      var numOutputs = range.length / 2;
+      var numOutputs = range.length >> 1;
+      var numInputs = domain.length >> 1;
       var evaluator = new PostScriptEvaluator(code);
       // Cache the values for a big speed up, the cache size is limited though
       // since the number of possible values can be huge from a PS function.
-      var cache = new FunctionCache();
+      var cache = {};
+      // The MAX_CACHE_SIZE is set to ~4x the maximum number of distinct values
+      // seen in our tests.
+      var MAX_CACHE_SIZE = 2048 * 4;
+      var cache_available = MAX_CACHE_SIZE;
       return function constructPostScriptFromIRResult(args) {
-        var initialStack = [];
-        for (var i = 0, ii = (domain.length / 2); i < ii; ++i) {
-          initialStack.push(args[i]);
+        var i, value;
+        var key = '';
+        var input = new Array(numInputs);
+        for (i = 0; i < numInputs; i++) {
+          value = args[i];
+          input[i] = value;
+          key += value + '_';
         }
 
-        var key = initialStack.join('_');
-        if (cache.has(key)) {
-          return cache.get(key);
+        var cachedValue = cache[key];
+        if (cachedValue !== undefined) {
+          return cachedValue;
         }
 
-        var stack = evaluator.execute(initialStack);
-        var transformed = [];
-        for (i = numOutputs - 1; i >= 0; --i) {
-          var out = stack.pop();
-          var rangeIndex = 2 * i;
-          if (out < range[rangeIndex]) {
-            out = range[rangeIndex];
-          } else if (out > range[rangeIndex + 1]) {
-            out = range[rangeIndex + 1];
+        var output = new Array(numOutputs);
+        var stack = evaluator.execute(input);
+        var stackIndex = stack.length - numOutputs;
+        for (i = 0; i < numOutputs; i++) {
+          value = stack[stackIndex + i];
+          var bound = range[i * 2];
+          if (value < bound) {
+            value = bound;
+          } else {
+            bound = range[i * 2 +1];
+            if (value > bound) {
+              value = bound;
+            }
           }
-          transformed[i] = out;
+          output[i] = value;
         }
-        cache.set(key, transformed);
-        return transformed;
+        if (cache_available > 0) {
+          cache_available--;
+          cache[key] = output;
+        }
+        return output;
       };
     }
   };
-})();
-
-var FunctionCache = (function FunctionCacheClosure() {
-  // Of 10 PDF's with type4 functions the maxium number of distinct values seen
-  // was 256. This still may need some tweaking in the future though.
-  var MAX_CACHE_SIZE = 1024;
-  function FunctionCache() {
-    this.cache = {};
-    this.total = 0;
-  }
-  FunctionCache.prototype = {
-    has: function FunctionCache_has(key) {
-      return key in this.cache;
-    },
-    get: function FunctionCache_get(key) {
-      return this.cache[key];
-    },
-    set: function FunctionCache_set(key, value) {
-      if (this.total < MAX_CACHE_SIZE) {
-        this.cache[key] = value;
-        this.total++;
-      }
-    }
-  };
-  return FunctionCache;
 })();
 
 var PostScriptStack = (function PostScriptStackClosure() {
@@ -3363,11 +3394,9 @@ var Annotation = (function AnnotationClosure() {
     },
 
     getOperatorList: function Annotation_getOperatorList(evaluator) {
-      var capability = createPromiseCapability();
 
       if (!this.appearance) {
-        capability.resolve(new OperatorList());
-        return capability.promise;
+        return Promise.resolve(new OperatorList());
       }
 
       var data = this.data;
@@ -3386,18 +3415,18 @@ var Annotation = (function AnnotationClosure() {
       var bbox = appearanceDict.get('BBox') || [0, 0, 1, 1];
       var matrix = appearanceDict.get('Matrix') || [1, 0, 0, 1, 0 ,0];
       var transform = getTransformMatrix(data.rect, bbox, matrix);
+      var self = this;
 
-      resourcesPromise.then(function(resources) {
-        var opList = new OperatorList();
-        opList.addOp(OPS.beginAnnotation, [data.rect, transform, matrix]);
-        evaluator.getOperatorList(this.appearance, resources, opList);
-        opList.addOp(OPS.endAnnotation, []);
-        capability.resolve(opList);
-
-        this.appearance.reset();
-      }.bind(this), capability.reject);
-
-      return capability.promise;
+      return resourcesPromise.then(function(resources) {
+          var opList = new OperatorList();
+          opList.addOp(OPS.beginAnnotation, [data.rect, transform, matrix]);
+          return evaluator.getOperatorList(self.appearance, resources, opList).
+            then(function () {
+              opList.addOp(OPS.endAnnotation, []);
+              self.appearance.reset();
+              return opList;
+            });
+        });
     }
   };
 
@@ -3656,8 +3685,10 @@ var TextWidgetAnnotation = (function TextWidgetAnnotationClosure() {
       }
 
       var stream = new Stream(stringToBytes(data.defaultAppearance));
-      evaluator.getOperatorList(stream, this.fieldResources, opList);
-      return Promise.resolve(opList);
+      return evaluator.getOperatorList(stream, this.fieldResources, opList).
+        then(function () {
+          return opList;
+        });
     }
   });
 
@@ -4303,6 +4334,10 @@ var ChunkedStream = (function ChunkedStreamClosure() {
 
     get length() {
       return this.end - this.start;
+    },
+
+    get isEmpty() {
+      return this.length === 0;
     },
 
     getByte: function ChunkedStream_getByte() {
@@ -5035,13 +5070,6 @@ var Page = (function PageClosure() {
 
     getOperatorList: function Page_getOperatorList(handler, intent) {
       var self = this;
-      var capability = createPromiseCapability();
-
-      function reject(e) {
-        capability.reject(e);
-      }
-
-      var pageListCapability = createPromiseCapability();
 
       var pdfManager = this.pdfManager;
       var contentStreamPromise = pdfManager.ensure(this, 'getContentStream',
@@ -5063,9 +5091,8 @@ var Page = (function PageClosure() {
                                                   this.idCounters,
                                                   this.fontCache);
 
-      var dataPromises = Promise.all([contentStreamPromise, resourcesPromise],
-                                     reject);
-      dataPromises.then(function(data) {
+      var dataPromises = Promise.all([contentStreamPromise, resourcesPromise]);
+      var pageListPromise = dataPromises.then(function(data) {
         var contentStream = data[0];
         var opList = new OperatorList(intent, handler, self.pageIndex);
 
@@ -5074,31 +5101,30 @@ var Page = (function PageClosure() {
           pageIndex: self.pageIndex,
           intent: intent
         });
-        partialEvaluator.getOperatorList(contentStream, self.resources, opList);
-        pageListCapability.resolve(opList);
+        return partialEvaluator.getOperatorList(contentStream, self.resources,
+          opList).then(function () {
+            return opList;
+          });
       });
 
       var annotationsPromise = pdfManager.ensure(this, 'annotations');
-      Promise.all([pageListCapability.promise, annotationsPromise]).then(
+      return Promise.all([pageListPromise, annotationsPromise]).then(
           function(datas) {
         var pageOpList = datas[0];
         var annotations = datas[1];
 
         if (annotations.length === 0) {
           pageOpList.flush(true);
-          capability.resolve(pageOpList);
-          return;
+          return pageOpList;
         }
 
         var annotationsReadyPromise = Annotation.appendToOperatorList(
           annotations, pageOpList, pdfManager, partialEvaluator, intent);
-        annotationsReadyPromise.then(function () {
+        return annotationsReadyPromise.then(function () {
           pageOpList.flush(true);
-          capability.resolve(pageOpList);
-        }, reject);
-      }, reject);
-
-      return capability.promise;
+          return pageOpList;
+        });
+      });
     },
 
     extractTextContent: function Page_extractTextContent() {
@@ -5811,7 +5837,7 @@ var Catalog = (function CatalogClosure() {
       var xref = this.xref;
       var dests = {}, nameTreeRef, nameDictionaryRef;
       var obj = this.catDict.get('Names');
-      if (obj) {
+      if (obj && obj.has('Dests')) {
         nameTreeRef = obj.getRaw('Dests');
       } else if (this.catDict.has('Dests')) {
         nameDictionaryRef = this.catDict.get('Dests');
@@ -5841,7 +5867,7 @@ var Catalog = (function CatalogClosure() {
     },
     get attachments() {
       var xref = this.xref;
-      var attachments, nameTreeRef;
+      var attachments = null, nameTreeRef;
       var obj = this.catDict.get('Names');
       if (obj) {
         nameTreeRef = obj.getRaw('EmbeddedFiles');
@@ -5899,11 +5925,17 @@ var Catalog = (function CatalogClosure() {
     },
 
     cleanup: function Catalog_cleanup() {
-      this.fontCache.forEach(function (font) {
-        delete font.sent;
-        delete font.translated;
+      var promises = [];
+      this.fontCache.forEach(function (promise) {
+        promises.push(promise);
       });
-      this.fontCache.clear();
+      return Promise.all(promises).then(function (fonts) {
+        for (var i = 0, ii = fonts.length; i < ii; i++) {
+          delete fonts[i].sent;
+          delete fonts[i].translated;
+        }
+        this.fontCache.clear();
+      }.bind(this));
     },
 
     getPage: function Catalog_getPage(pageIndex) {
@@ -15499,6 +15531,28 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
     this.fontCache = fontCache;
   }
 
+  // Trying to minimize Date.now() usage and check every 100 time
+  var TIME_SLOT_DURATION_MS = 20;
+  var CHECK_TIME_EVERY = 100;
+  function TimeSlotManager() {
+    this.reset();
+  }
+  TimeSlotManager.prototype = {
+    check: function TimeSlotManager_check() {
+      if (++this.checked < CHECK_TIME_EVERY) {
+        return false;
+      }
+      this.checked = 0;
+      return this.endTime <= Date.now();
+    },
+    reset: function TimeSlotManager_reset() {
+      this.endTime = Date.now() + TIME_SLOT_DURATION_MS;
+      this.checked = 0;
+    }
+  };
+
+  var deferred = Promise.resolve();
+
   var TILING_PATTERN = 1, SHADING_PATTERN = 2;
 
   PartialEvaluator.prototype = {
@@ -15582,13 +15636,15 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
 
       operatorList.addOp(OPS.paintFormXObjectBegin, [matrix, bbox]);
 
-      this.getOperatorList(xobj, (xobj.dict.get('Resources') || resources),
-                           operatorList, initialState);
-      operatorList.addOp(OPS.paintFormXObjectEnd, []);
+      return this.getOperatorList(xobj,
+        (xobj.dict.get('Resources') || resources), operatorList, initialState).
+        then(function () {
+          operatorList.addOp(OPS.paintFormXObjectEnd, []);
 
-      if (group) {
-        operatorList.addOp(OPS.endGroup, [groupOptions]);
-      }
+          if (group) {
+            operatorList.addOp(OPS.endGroup, [groupOptions]);
+          }
+        });
     },
 
     buildPaintImageXObject:
@@ -15675,7 +15731,7 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
         then(function(imageObj) {
           var imgData = imageObj.createImageData(/* forceRGBA = */ false);
           self.handler.send('obj', [objId, self.pageIndex, 'Image', imgData],
-            null, [imgData.data.buffer]);
+            [imgData.data.buffer]);
         }).then(null, function (reason) {
           warn('Unable to decode image: ' + reason);
           self.handler.send('obj', [objId, self.pageIndex, 'Image', null]);
@@ -15697,7 +15753,7 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
         subtype: smask.get('S').name,
         backdrop: smask.get('BC')
       };
-      this.buildFormXObject(resources, smaskContent, smaskOptions,
+      return this.buildFormXObject(resources, smaskContent, smaskOptions,
                             operatorList, stateManager.state.clone());
     },
 
@@ -15706,15 +15762,18 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
                                                    pattern, patternDict,
                                                    operatorList) {
       // Create an IR of the pattern code.
-      var tilingOpList = this.getOperatorList(pattern,
-        (patternDict.get('Resources') || resources));
-      // Add the dependencies to the parent operator list so they are resolved
-      // before sub operator list is executed synchronously.
-      operatorList.addDependencies(tilingOpList.dependencies);
-      operatorList.addOp(fn, getTilingPatternIR({
-                               fnArray: tilingOpList.fnArray,
-                               argsArray: tilingOpList.argsArray
-                             }, patternDict, args));
+      var tilingOpList = new OperatorList();
+      return this.getOperatorList(pattern,
+        (patternDict.get('Resources') || resources), tilingOpList).
+        then(function () {
+          // Add the dependencies to the parent operator list so they are
+          // resolved before sub operator list is executed synchronously.
+          operatorList.addDependencies(tilingOpList.dependencies);
+          operatorList.addOp(fn, getTilingPatternIR({
+            fnArray: tilingOpList.fnArray,
+            argsArray: tilingOpList.argsArray
+          }, patternDict, args));
+        });
     },
 
     handleSetFont:
@@ -15727,22 +15786,23 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
         fontName = fontArgs[0].name;
       }
       var self = this;
-      var font = this.loadFont(fontName, fontRef, this.xref, resources,
-                               operatorList);
-      state.font = font;
-      var loadedName = font.loadedName;
-      if (!font.sent) {
-        var fontData = font.translated.exportData();
+      return this.loadFont(fontName, fontRef, this.xref, resources,
+                               operatorList).then(function (font) {
+          state.font = font;
+          var loadedName = font.loadedName;
+          if (!font.sent) {
+            var fontData = font.translated.exportData();
 
-        self.handler.send('commonobj', [
-          loadedName,
-          'Font',
-          fontData
-        ]);
-        font.sent = true;
-      }
+            self.handler.send('commonobj', [
+              loadedName,
+              'Font',
+              fontData
+            ]);
+            font.sent = true;
+          }
 
-      return loadedName;
+          return loadedName;
+        });
     },
 
     handleText: function PartialEvaluator_handleText(chars, state) {
@@ -15751,11 +15811,7 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
       var isAddToPathSet = !!(state.textRenderingMode &
                               TextRenderingMode.ADD_TO_PATH_FLAG);
       if (font.data && (isAddToPathSet || PDFJS.disableFontFace)) {
-        for (var i = 0; i < glyphs.length; i++) {
-          if (glyphs[i] === null) {
-            continue;
-          }
-          var fontChar = glyphs[i].fontChar;
+        var buildPath = function (fontChar) {
           if (!font.renderer.hasBuiltPath(fontChar)) {
             var path = font.renderer.getPathJs(fontChar);
             this.handler.send('commonobj', [
@@ -15763,6 +15819,21 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
               'FontPath',
               path
             ]);
+          }
+        }.bind(this);
+
+        for (var i = 0, ii = glyphs.length; i < ii; i++) {
+          var glyph = glyphs[i];
+          if (glyph === null) {
+            continue;
+          }
+          buildPath(glyph.fontChar);
+
+          // If the glyph has an accent we need to build a path for its
+          // fontChar too, otherwise CanvasGraphics_paintChar will fail.
+          var accent = glyph.accent;
+          if (accent && accent.fontChar) {
+            buildPath(accent.fontChar);
           }
         }
       }
@@ -15774,7 +15845,6 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
                                                    operatorList, xref,
                                                    stateManager) {
 
-      var self = this;
       // TODO(mack): This should be rewritten so that this function returns
       // what should be added to the queue during each iteration
       function setGStateForKey(gStateObj, key, value) {
@@ -15793,11 +15863,14 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
             gStateObj.push([key, value]);
             break;
           case 'Font':
-            var loadedName = self.handleSetFont(resources, null, value[0],
-                                                operatorList,
-                                                stateManager.state);
-            operatorList.addDependency(loadedName);
-            gStateObj.push([key, [loadedName, value[1]]]);
+            promise = promise.then(function () {
+              return self.handleSetFont(resources, null, value[0],
+                                        operatorList, stateManager.state).
+                then(function (loadedName) {
+                  operatorList.addDependency(loadedName);
+                  gStateObj.push([key, [loadedName, value[1]]]);
+                });
+            });
             break;
           case 'BM':
             gStateObj.push([key, value]);
@@ -15809,7 +15882,10 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
             }
             var dict = xref.fetchIfRef(value);
             if (isDict(dict)) {
-              self.handleSMask(dict, resources, operatorList, stateManager);
+              promise = promise.then(function () {
+                return self.handleSMask(dict, resources, operatorList,
+                                        stateManager);
+              });
               gStateObj.push([key, true]);
             } else {
               warn('Unsupported SMask type');
@@ -15844,12 +15920,15 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
       // This array holds the converted/processed state data.
       var gStateObj = [];
       var gStateMap = gState.map;
+      var self = this;
+      var promise = Promise.resolve();
       for (var key in gStateMap) {
         var value = gStateMap[key];
         setGStateForKey(gStateObj, key, value);
       }
-
-      operatorList.addOp(OPS.setGState, [gStateObj]);
+      return promise.then(function () {
+        operatorList.addOp(OPS.setGState, [gStateObj]);
+      });
     },
 
     loadFont: function PartialEvaluator_loadFont(fontName, font, xref,
@@ -15857,10 +15936,10 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
                                                  parentOperatorList) {
 
       function errorFont() {
-        return {
+        return Promise.resolve({
           translated: new ErrorFont('Font ' + fontName + ' is not available'),
           loadedName: 'g_font_error'
-        };
+        });
       }
 
       var fontRef;
@@ -15884,6 +15963,8 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
       if (!isDict(font)) {
         return errorFont();
       }
+
+      var fontCapability = createPromiseCapability();
 
       var preEvaluatedFont = this.preEvaluateFont(font, xref);
       var descriptor = preEvaluatedFont.descriptor;
@@ -15921,7 +16002,7 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
       // fontName in font.loadedName below.
       var fontRefIsDict = isDict(fontRef);
       if (!fontRefIsDict) {
-        this.fontCache.put(fontRef, font);
+        this.fontCache.put(fontRef, fontCapability.promise);
       }
 
       // Keep track of each font we translated so the caller can
@@ -15940,27 +16021,38 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
         font.translated = translated;
       }
 
+      var loadCharProcsPromise = Promise.resolve();
       if (font.translated.loadCharProcs) {
         var charProcs = font.get('CharProcs').getAll();
         var fontResources = (font.get('Resources') || resources);
         var charProcKeys = Object.keys(charProcs);
         var charProcOperatorList = {};
         for (var i = 0, n = charProcKeys.length; i < n; ++i) {
-          var key = charProcKeys[i];
-          var glyphStream = charProcs[key];
-          var operatorList = this.getOperatorList(glyphStream, fontResources);
-          charProcOperatorList[key] = operatorList.getIR();
-          if (!parentOperatorList) {
-            continue;
-          }
-          // Add the dependencies to the parent operator list so they are
-          // resolved before sub operator list is executed synchronously.
-          parentOperatorList.addDependencies(charProcOperatorList.dependencies);
+          loadCharProcsPromise = loadCharProcsPromise.then(function (key) {
+            var glyphStream = charProcs[key];
+            var operatorList = new OperatorList();
+            return this.getOperatorList(glyphStream, fontResources,
+                                        operatorList).
+              then(function () {
+                charProcOperatorList[key] = operatorList.getIR();
+
+                // Add the dependencies to the parent operator list so they are
+                // resolved before sub operator list is executed synchronously.
+                if (parentOperatorList) {
+                  parentOperatorList.addDependencies(operatorList.dependencies);
+                }
+              });
+          }.bind(this, charProcKeys[i]));
         }
-        font.translated.charProcOperatorList = charProcOperatorList;
+        loadCharProcsPromise = loadCharProcsPromise.then(function () {
+          font.translated.charProcOperatorList = charProcOperatorList;
+        });
       }
-      font.loaded = true;
-      return font;
+      return loadCharProcsPromise.then(function () {
+        font.loaded = true;
+        fontCapability.resolve(font);
+        return fontCapability.promise;
+      }, fontCapability.reject);
     },
 
     buildPath: function PartialEvaluator_buildPath(operatorList, fn, args) {
@@ -15984,182 +16076,196 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
       var xref = this.xref;
       var imageCache = {};
 
-      operatorList = (operatorList || new OperatorList());
+      assert(operatorList);
 
       resources = (resources || Dict.empty);
       var xobjs = (resources.get('XObject') || Dict.empty);
       var patterns = (resources.get('Pattern') || Dict.empty);
       var stateManager = new StateManager(initialState || new EvalState());
       var preprocessor = new EvaluatorPreprocessor(stream, xref, stateManager);
+      var shading;
+      var timeSlotManager = new TimeSlotManager();
 
-      var operation, i, ii;
-      while ((operation = preprocessor.read())) {
-        var args = operation.args;
-        var fn = operation.fn;
-        var shading;
+      return new Promise(function next(resolve, reject) {
+        timeSlotManager.reset();
+        var stop, operation, i, ii;
+        while (!(stop = timeSlotManager.check()) &&
+               (operation = preprocessor.read())) {
+          var args = operation.args;
+          var fn = operation.fn;
 
-        switch (fn | 0) {
-          case OPS.setStrokeColorN:
-          case OPS.setFillColorN:
-            if (args[args.length - 1].code) {
+          switch (fn | 0) {
+            case OPS.setStrokeColorN:
+            case OPS.setFillColorN:
+              if (args[args.length - 1].code) {
+                break;
+              }
+              // compile tiling patterns
+              var patternName = args[args.length - 1];
+              // SCN/scn applies patterns along with normal colors
+              var pattern;
+              if (isName(patternName) &&
+                  (pattern = patterns.get(patternName.name))) {
+                var dict = (isStream(pattern) ? pattern.dict : pattern);
+                var typeNum = dict.get('PatternType');
+
+                if (typeNum == TILING_PATTERN) {
+                  return self.handleTilingType(fn, args, resources, pattern,
+                                               dict, operatorList).then(
+                    function() {
+                      next(resolve, reject);
+                    }, reject);
+                } else if (typeNum == SHADING_PATTERN) {
+                  shading = dict.get('Shading');
+                  var matrix = dict.get('Matrix');
+                  pattern = Pattern.parseShading(shading, matrix, xref,
+                    resources);
+                  args = pattern.getIR();
+                } else {
+                  error('Unknown PatternType ' + typeNum);
+                }
+              }
               break;
-            }
-            // compile tiling patterns
-            var patternName = args[args.length - 1];
-            // SCN/scn applies patterns along with normal colors
-            var pattern;
-            if (isName(patternName) &&
-                (pattern = patterns.get(patternName.name))) {
-              var dict = (isStream(pattern) ? pattern.dict : pattern);
-              var typeNum = dict.get('PatternType');
-
-              if (typeNum == TILING_PATTERN) {
-                self.handleTilingType(fn, args, resources, pattern, dict,
-                                      operatorList);
+            case OPS.paintXObject:
+              if (args[0].code) {
+                break;
+              }
+              // eagerly compile XForm objects
+              var name = args[0].name;
+              if (imageCache.key === name) {
+                operatorList.addOp(imageCache.fn, imageCache.args);
                 args = [];
                 continue;
-              } else if (typeNum == SHADING_PATTERN) {
-                shading = dict.get('Shading');
-                var matrix = dict.get('Matrix');
-                pattern = Pattern.parseShading(shading, matrix, xref,
-                                               resources);
-                args = pattern.getIR();
-              } else {
-                error('Unkown PatternType ' + typeNum);
               }
-            }
-            break;
-          case OPS.paintXObject:
-            if (args[0].code) {
+
+              var xobj = xobjs.get(name);
+              if (xobj) {
+                assert(isStream(xobj), 'XObject should be a stream');
+
+                var type = xobj.dict.get('Subtype');
+                assert(isName(type),
+                  'XObject should have a Name subtype');
+
+                if ('Form' == type.name) {
+                  stateManager.save();
+                  return self.buildFormXObject(resources, xobj, null,
+                                               operatorList,
+                                               stateManager.state.clone()).
+                    then(function () {
+                      stateManager.restore();
+                      next(resolve, reject);
+                    }, reject);
+                } else if ('Image' == type.name) {
+                  self.buildPaintImageXObject(resources, xobj, false,
+                    operatorList, name, imageCache);
+                  args = [];
+                  continue;
+                } else {
+                  error('Unhandled XObject subtype ' + type.name);
+                }
+              }
               break;
-            }
-            // eagerly compile XForm objects
-            var name = args[0].name;
-            if (imageCache.key === name) {
-              operatorList.addOp(imageCache.fn, imageCache.args);
+            case OPS.setFont:
+              var fontSize = args[1];
+              // eagerly collect all fonts
+              return self.handleSetFont(resources, args, null,
+                                        operatorList, stateManager.state).
+                then(function (loadedName) {
+                  operatorList.addDependency(loadedName);
+                  operatorList.addOp(OPS.setFont, [loadedName, fontSize]);
+                  next(resolve, reject);
+                }, reject);
+            case OPS.endInlineImage:
+              var cacheKey = args[0].cacheKey;
+              if (cacheKey && imageCache.key === cacheKey) {
+                operatorList.addOp(imageCache.fn, imageCache.args);
+                args = [];
+                continue;
+              }
+              self.buildPaintImageXObject(resources, args[0], true,
+                operatorList, cacheKey, imageCache);
               args = [];
               continue;
-            }
-
-            var xobj = xobjs.get(name);
-            if (xobj) {
-              assert(isStream(xobj), 'XObject should be a stream');
-
-              var type = xobj.dict.get('Subtype');
-              assert(isName(type),
-                'XObject should have a Name subtype');
-
-              if ('Form' == type.name) {
-                stateManager.save();
-                self.buildFormXObject(resources, xobj, null, operatorList,
-                                      stateManager.state.clone());
-                args = [];
-                stateManager.restore();
-                continue;
-              } else if ('Image' == type.name) {
-                self.buildPaintImageXObject(resources, xobj, false,
-                                            operatorList, name, imageCache);
-                args = [];
-                continue;
-              } else {
-                error('Unhandled XObject subtype ' + type.name);
-              }
-            }
-            break;
-          case OPS.setFont:
-            // eagerly collect all fonts
-            var loadedName = self.handleSetFont(resources, args, null,
-                                                operatorList,
-                                                stateManager.state);
-            operatorList.addDependency(loadedName);
-            args[0] = loadedName;
-            break;
-          case OPS.endInlineImage:
-            var cacheKey = args[0].cacheKey;
-            if (cacheKey && imageCache.key === cacheKey) {
-              operatorList.addOp(imageCache.fn, imageCache.args);
-              args = [];
-              continue;
-            }
-            self.buildPaintImageXObject(resources, args[0], true,
-                                        operatorList, cacheKey, imageCache);
-            args = [];
-            continue;
-          case OPS.showText:
-            args[0] = this.handleText(args[0], stateManager.state);
-            break;
-          case OPS.showSpacedText:
-            var arr = args[0];
-            var arrLength = arr.length;
-            for (i = 0; i < arrLength; ++i) {
-              if (isString(arr[i])) {
-                arr[i] = this.handleText(arr[i], stateManager.state);
-              }
-            }
-            break;
-          case OPS.nextLineShowText:
-            args[0] = this.handleText(args[0], stateManager.state);
-            break;
-          case OPS.nextLineSetSpacingShowText:
-            args[2] = this.handleText(args[2], stateManager.state);
-            break;
-          case OPS.setTextRenderingMode:
-            stateManager.state.textRenderingMode = args[0];
-            break;
-          // Parse the ColorSpace data to a raw format.
-          case OPS.setFillColorSpace:
-          case OPS.setStrokeColorSpace:
-            args = [ColorSpace.parseToIR(args[0], xref, resources)];
-            break;
-          case OPS.shadingFill:
-            var shadingRes = resources.get('Shading');
-            if (!shadingRes) {
-              error('No shading resource found');
-            }
-
-            shading = shadingRes.get(args[0].name);
-            if (!shading) {
-              error('No shading object found');
-            }
-
-            var shadingFill = Pattern.parseShading(shading, null, xref,
-                                                   resources);
-            var patternIR = shadingFill.getIR();
-            args = [patternIR];
-            fn = OPS.shadingFill;
-            break;
-          case OPS.setGState:
-            var dictName = args[0];
-            var extGState = resources.get('ExtGState');
-
-            if (!isDict(extGState) || !extGState.has(dictName.name)) {
+            case OPS.showText:
+              args[0] = self.handleText(args[0], stateManager.state);
               break;
-            }
+            case OPS.showSpacedText:
+              var arr = args[0];
+              var arrLength = arr.length;
+              for (i = 0; i < arrLength; ++i) {
+                if (isString(arr[i])) {
+                  arr[i] = self.handleText(arr[i], stateManager.state);
+                }
+              }
+              break;
+            case OPS.nextLineShowText:
+              args[0] = self.handleText(args[0], stateManager.state);
+              break;
+            case OPS.nextLineSetSpacingShowText:
+              args[2] = self.handleText(args[2], stateManager.state);
+              break;
+            case OPS.setTextRenderingMode:
+              stateManager.state.textRenderingMode = args[0];
+              break;
+            // Parse the ColorSpace data to a raw format.
+            case OPS.setFillColorSpace:
+            case OPS.setStrokeColorSpace:
+              args = [ColorSpace.parseToIR(args[0], xref, resources)];
+              break;
+            case OPS.shadingFill:
+              var shadingRes = resources.get('Shading');
+              if (!shadingRes) {
+                error('No shading resource found');
+              }
 
-            var gState = extGState.get(dictName.name);
-            self.setGState(resources, gState, operatorList, xref,
-                           stateManager);
-            args = [];
-            continue;
-          case OPS.moveTo:
-          case OPS.lineTo:
-          case OPS.curveTo:
-          case OPS.curveTo2:
-          case OPS.curveTo3:
-          case OPS.closePath:
-            self.buildPath(operatorList, fn, args);
-            continue;
+              shading = shadingRes.get(args[0].name);
+              if (!shading) {
+                error('No shading object found');
+              }
+
+              var shadingFill = Pattern.parseShading(shading, null, xref,
+                resources);
+              var patternIR = shadingFill.getIR();
+              args = [patternIR];
+              fn = OPS.shadingFill;
+              break;
+            case OPS.setGState:
+              var dictName = args[0];
+              var extGState = resources.get('ExtGState');
+
+              if (!isDict(extGState) || !extGState.has(dictName.name)) {
+                break;
+              }
+
+              var gState = extGState.get(dictName.name);
+              return self.setGState(resources, gState, operatorList, xref,
+                stateManager).then(function() {
+                  next(resolve, reject);
+                }, reject);
+            case OPS.moveTo:
+            case OPS.lineTo:
+            case OPS.curveTo:
+            case OPS.curveTo2:
+            case OPS.curveTo3:
+            case OPS.closePath:
+              self.buildPath(operatorList, fn, args);
+              continue;
+          }
+          operatorList.addOp(fn, args);
         }
-        operatorList.addOp(fn, args);
-      }
-
-      // Some PDFs don't close all restores inside object/form.
-      // Closing those for them.
-      for (i = 0, ii = preprocessor.savedStatesDepth; i < ii; i++) {
-        operatorList.addOp(OPS.restore, []);
-      }
-
-      return operatorList;
+        if (stop) {
+          deferred.then(function () {
+            next(resolve, reject);
+          });
+          return;
+        }
+        // Some PDFs don't close all restores inside object/form.
+        // Closing those for them.
+        for (i = 0, ii = preprocessor.savedStatesDepth; i < ii; i++) {
+          operatorList.addOp(OPS.restore, []);
+        }
+        resolve();
+      });
     },
 
     getTextContent: function PartialEvaluator_getTextContent(stream, resources,
@@ -16217,10 +16323,13 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
       }
 
       function handleSetFont(fontName, fontRef) {
-        var font = textState.font = self.loadFont(fontName, fontRef, xref,
-                                                  resources, null).translated;
-        textState.fontMatrix = font.fontMatrix ? font.fontMatrix :
-                                 FONT_IDENTITY_MATRIX;
+        return self.loadFont(fontName, fontRef, xref, resources, null).
+          then(function (font) {
+            var fontTranslated = textState.font = font.translated;
+            textState.fontMatrix = fontTranslated.fontMatrix ?
+              fontTranslated.fontMatrix :
+              FONT_IDENTITY_MATRIX;
+          });
       }
 
       function buildTextGeometry(chars, textChunk) {
@@ -16315,171 +16424,192 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
         return textChunk;
       }
 
-      while ((operation = preprocessor.read())) {
-        textState = stateManager.state;
-        var fn = operation.fn;
-        var args = operation.args;
-        switch (fn | 0) {
-          case OPS.setFont:
-            handleSetFont(args[0].name);
-            textState.fontSize = args[1];
-            break;
-          case OPS.setTextRise:
-            textState.textRise = args[0];
-            break;
-          case OPS.setHScale:
-            textState.textHScale = args[0] / 100;
-            break;
-          case OPS.setLeading:
-            textState.leading = args[0];
-            break;
-          case OPS.moveText:
-            textState.translateTextLineMatrix(args[0], args[1]);
-            textState.textMatrix = textState.textLineMatrix.slice();
-            break;
-          case OPS.setLeadingMoveText:
-            textState.leading = -args[1];
-            textState.translateTextLineMatrix(args[0], args[1]);
-            textState.textMatrix = textState.textLineMatrix.slice();
-            break;
-          case OPS.nextLine:
-            textState.carriageReturn();
-            break;
-          case OPS.setTextMatrix:
-            textState.setTextMatrix(args[0], args[1], args[2], args[3],
-                                    args[4], args[5]);
-            textState.setTextLineMatrix(args[0], args[1], args[2], args[3],
-                                        args[4], args[5]);
-            break;
-          case OPS.setCharSpacing:
-            textState.charSpacing = args[0];
-            break;
-          case OPS.setWordSpacing:
-            textState.wordSpacing = args[0];
-            break;
-          case OPS.beginText:
-            textState.textMatrix = IDENTITY_MATRIX.slice();
-            textState.textLineMatrix = IDENTITY_MATRIX.slice();
-            break;
-          case OPS.showSpacedText:
-            var items = args[0];
-            var textChunk = newTextChunk();
-            var offset;
-            for (var j = 0, jj = items.length; j < jj; j++) {
-              if (typeof items[j] === 'string') {
-                buildTextGeometry(items[j], textChunk);
-              } else {
-                var val = items[j] / 1000;
-                if (!textState.font.vertical) {
-                  offset = -val * textState.fontSize * textState.textHScale *
-                           textState.textMatrix[0];
-                  textState.translateTextMatrix(offset, 0);
-                  textChunk.width += offset;
+      var timeSlotManager = new TimeSlotManager();
+
+      return new Promise(function next(resolve, reject) {
+        timeSlotManager.reset();
+        var stop;
+        while (!(stop = timeSlotManager.check()) &&
+               (operation = preprocessor.read())) {
+          textState = stateManager.state;
+          var fn = operation.fn;
+          var args = operation.args;
+          switch (fn | 0) {
+            case OPS.setFont:
+              textState.fontSize = args[1];
+              return handleSetFont(args[0].name).then(function() {
+                next(resolve, reject);
+              }, reject);
+            case OPS.setTextRise:
+              textState.textRise = args[0];
+              break;
+            case OPS.setHScale:
+              textState.textHScale = args[0] / 100;
+              break;
+            case OPS.setLeading:
+              textState.leading = args[0];
+              break;
+            case OPS.moveText:
+              textState.translateTextLineMatrix(args[0], args[1]);
+              textState.textMatrix = textState.textLineMatrix.slice();
+              break;
+            case OPS.setLeadingMoveText:
+              textState.leading = -args[1];
+              textState.translateTextLineMatrix(args[0], args[1]);
+              textState.textMatrix = textState.textLineMatrix.slice();
+              break;
+            case OPS.nextLine:
+              textState.carriageReturn();
+              break;
+            case OPS.setTextMatrix:
+              textState.setTextMatrix(args[0], args[1], args[2], args[3],
+                args[4], args[5]);
+              textState.setTextLineMatrix(args[0], args[1], args[2], args[3],
+                args[4], args[5]);
+              break;
+            case OPS.setCharSpacing:
+              textState.charSpacing = args[0];
+              break;
+            case OPS.setWordSpacing:
+              textState.wordSpacing = args[0];
+              break;
+            case OPS.beginText:
+              textState.textMatrix = IDENTITY_MATRIX.slice();
+              textState.textLineMatrix = IDENTITY_MATRIX.slice();
+              break;
+            case OPS.showSpacedText:
+              var items = args[0];
+              var textChunk = newTextChunk();
+              var offset;
+              for (var j = 0, jj = items.length; j < jj; j++) {
+                if (typeof items[j] === 'string') {
+                  buildTextGeometry(items[j], textChunk);
                 } else {
-                  offset = -val * textState.fontSize * textState.textMatrix[3];
-                  textState.translateTextMatrix(0, offset);
-                  textChunk.height += offset;
-                }
-                if (items[j] < 0 && textState.font.spaceWidth > 0) {
-                  var fakeSpaces = -items[j] / textState.font.spaceWidth;
-                  if (fakeSpaces > MULTI_SPACE_FACTOR) {
-                    fakeSpaces = Math.round(fakeSpaces);
-                    while (fakeSpaces--) {
+                  var val = items[j] / 1000;
+                  if (!textState.font.vertical) {
+                    offset = -val * textState.fontSize * textState.textHScale *
+                      textState.textMatrix[0];
+                    textState.translateTextMatrix(offset, 0);
+                    textChunk.width += offset;
+                  } else {
+                    offset = -val * textState.fontSize *
+                      textState.textMatrix[3];
+                    textState.translateTextMatrix(0, offset);
+                    textChunk.height += offset;
+                  }
+                  if (items[j] < 0 && textState.font.spaceWidth > 0) {
+                    var fakeSpaces = -items[j] / textState.font.spaceWidth;
+                    if (fakeSpaces > MULTI_SPACE_FACTOR) {
+                      fakeSpaces = Math.round(fakeSpaces);
+                      while (fakeSpaces--) {
+                        textChunk.str += ' ';
+                      }
+                    } else if (fakeSpaces > SPACE_FACTOR) {
                       textChunk.str += ' ';
                     }
-                  } else if (fakeSpaces > SPACE_FACTOR) {
-                    textChunk.str += ' ';
                   }
                 }
               }
-            }
-            bidiTexts.push(runBidi(textChunk));
-            break;
-          case OPS.showText:
-            bidiTexts.push(runBidi(buildTextGeometry(args[0])));
-            break;
-          case OPS.nextLineShowText:
-            textState.carriageReturn();
-            bidiTexts.push(runBidi(buildTextGeometry(args[0])));
-            break;
-          case OPS.nextLineSetSpacingShowText:
-            textState.wordSpacing = args[0];
-            textState.charSpacing = args[1];
-            textState.carriageReturn();
-            bidiTexts.push(runBidi(buildTextGeometry(args[2])));
-            break;
-          case OPS.paintXObject:
-            if (args[0].code) {
+              bidiTexts.push(runBidi(textChunk));
               break;
-            }
+            case OPS.showText:
+              bidiTexts.push(runBidi(buildTextGeometry(args[0])));
+              break;
+            case OPS.nextLineShowText:
+              textState.carriageReturn();
+              bidiTexts.push(runBidi(buildTextGeometry(args[0])));
+              break;
+            case OPS.nextLineSetSpacingShowText:
+              textState.wordSpacing = args[0];
+              textState.charSpacing = args[1];
+              textState.carriageReturn();
+              bidiTexts.push(runBidi(buildTextGeometry(args[2])));
+              break;
+            case OPS.paintXObject:
+              if (args[0].code) {
+                break;
+              }
 
-            if (!xobjs) {
-              xobjs = (resources.get('XObject') || Dict.empty);
-            }
+              if (!xobjs) {
+                xobjs = (resources.get('XObject') || Dict.empty);
+              }
 
-            var name = args[0].name;
-            if (xobjsCache.key === name) {
-              if (xobjsCache.texts) {
-                Util.concatenateToArray(bidiTexts, xobjsCache.texts.items);
-                Util.extendObj(textContent.styles, xobjsCache.texts.styles);
+              var name = args[0].name;
+              if (xobjsCache.key === name) {
+                if (xobjsCache.texts) {
+                  Util.concatenateToArray(bidiTexts, xobjsCache.texts.items);
+                  Util.extendObj(textContent.styles, xobjsCache.texts.styles);
+                }
+                break;
+              }
+
+              var xobj = xobjs.get(name);
+              if (!xobj) {
+                break;
+              }
+              assert(isStream(xobj), 'XObject should be a stream');
+
+              var type = xobj.dict.get('Subtype');
+              assert(isName(type),
+                'XObject should have a Name subtype');
+
+              if ('Form' !== type.name) {
+                xobjsCache.key = name;
+                xobjsCache.texts = null;
+                break;
+              }
+
+              stateManager.save();
+              var matrix = xobj.dict.get('Matrix');
+              if (isArray(matrix) && matrix.length === 6) {
+                stateManager.transform(matrix);
+              }
+
+              return self.getTextContent(xobj,
+                xobj.dict.get('Resources') || resources, stateManager).
+                then(function (formTextContent) {
+                  Util.concatenateToArray(bidiTexts, formTextContent.items);
+                  Util.extendObj(textContent.styles, formTextContent.styles);
+                  stateManager.restore();
+
+                  xobjsCache.key = name;
+                  xobjsCache.texts = formTextContent;
+
+                  next(resolve, reject);
+                }, reject);
+            case OPS.setGState:
+              var dictName = args[0];
+              var extGState = resources.get('ExtGState');
+
+              if (!isDict(extGState) || !extGState.has(dictName.name)) {
+                break;
+              }
+
+              var gsStateMap = extGState.get(dictName.name);
+              var gsStateFont = null;
+              for (var key in gsStateMap) {
+                if (key === 'Font') {
+                  assert(!gsStateFont);
+                  gsStateFont = gsStateMap[key];
+                }
+              }
+              if (gsStateFont) {
+                textState.fontSize = gsStateFont[1];
+                return handleSetFont(gsStateFont[0]).then(function() {
+                  next(resolve, reject);
+                }, reject);
               }
               break;
-            }
-
-            var xobj = xobjs.get(name);
-            if (!xobj) {
-              break;
-            }
-            assert(isStream(xobj), 'XObject should be a stream');
-
-            var type = xobj.dict.get('Subtype');
-            assert(isName(type),
-              'XObject should have a Name subtype');
-
-            if ('Form' !== type.name) {
-              xobjsCache.key = name;
-              xobjsCache.texts = null;
-              break;
-            }
-
-            stateManager.save();
-            var matrix = xobj.dict.get('Matrix');
-            if (isArray(matrix) && matrix.length === 6) {
-              stateManager.transform(matrix);
-            }
-
-            var formTextContent = this.getTextContent(
-              xobj,
-              xobj.dict.get('Resources') || resources,
-              stateManager
-            );
-            Util.concatenateToArray(bidiTexts, formTextContent.items);
-            Util.extendObj(textContent.styles, formTextContent.styles);
-            stateManager.restore();
-
-            xobjsCache.key = name;
-            xobjsCache.texts = formTextContent;
-            break;
-          case OPS.setGState:
-            var dictName = args[0];
-            var extGState = resources.get('ExtGState');
-
-            if (!isDict(extGState) || !extGState.has(dictName.name)) {
-              break;
-            }
-
-            var gsState = extGState.get(dictName.name);
-
-            for (var i = 0; i < gsState.length; i++) {
-              if (gsState[i] === 'Font') {
-                handleSetFont(args[0].name);
-              }
-            }
-            break;
-        } // switch
-      } // while
-
-      return textContent;
+          } // switch
+        } // while
+        if (stop) {
+          deferred.then(function () {
+            next(resolve, reject);
+          });
+          return;
+        }
+        resolve(textContent);
+      });
     },
 
     extractDataStructures: function
@@ -17073,7 +17203,7 @@ var OperatorList = (function OperatorListClosure() {
         },
         pageIndex: this.pageIndex,
         intent: this.intent
-      }, null, transfers);
+      }, transfers);
       this.dependencies = {};
       this.fnArray.length = 0;
       this.argsArray.length = 0;
@@ -17296,6 +17426,7 @@ var EvaluatorPreprocessor = (function EvaluatorPreprocessorClosure() {
     // dictionary
     this.parser = new Parser(new Lexer(stream, OP_MAP), false, xref);
     this.stateManager = stateManager;
+    this.nonProcessedArgs = [];
   }
 
   EvaluatorPreprocessor.prototype = {
@@ -17328,6 +17459,17 @@ var EvaluatorPreprocessor = (function EvaluatorPreprocessorClosure() {
         }
 
         var fn = opSpec.id;
+
+        // Some post script commands can be nested, e.g. /F2 /GS2 gs 5.711 Tf
+        if (!opSpec.variableArgs && args.length !== opSpec.numArgs) {
+          while (args.length > opSpec.numArgs) {
+            this.nonProcessedArgs.push(args.shift());
+          }
+
+          while (args.length < opSpec.numArgs && this.nonProcessedArgs.length) {
+            args.unshift(this.nonProcessedArgs.pop());
+          }
+        }
 
         // Validate the number of arguments for the command
         if (opSpec.variableArgs) {
@@ -20716,7 +20858,13 @@ var Font = (function FontClosure() {
       this.defaultVMetrics = properties.defaultVMetrics;
     }
 
-    if (!file) {
+    if (!file || file.isEmpty) {
+      if (file) {
+        // Some bad PDF generators will include empty font files,
+        // attempting to recover by assuming that no file exists.
+        warn('Font file is empty in "' + name + '" (' + this.loadedName + ')');
+      }
+
       this.missingFile = true;
       // The file data is not specified. Trying to fix the font name
       // to be used with the canvas.font.
@@ -30414,14 +30562,11 @@ var PDFImage = (function PDFImageClosure() {
       var colorSpace = dict.get('ColorSpace', 'CS');
       colorSpace = ColorSpace.parse(colorSpace, xref, res);
       var numComps = colorSpace.numComps;
-      var resolvePromise;
-      handler.send('JpegDecode', [image.getIR(), numComps], function(message) {
+      var decodePromise = handler.sendWithPromise('JpegDecode',
+                                                  [image.getIR(), numComps]);
+      return decodePromise.then(function (message) {
         var data = message.data;
-        var stream = new Stream(data, 0, data.length, image.dict);
-        resolvePromise(stream);
-      });
-      return new Promise(function (resolve) {
-        resolvePromise = resolve;
+        return new Stream(data, 0, data.length, image.dict);
       });
     } else {
       return Promise.resolve(image);
@@ -33973,7 +34118,7 @@ var Metrics = {
 var EOF = {};
 
 function isEOF(v) {
-  return (v == EOF);
+  return (v === EOF);
 }
 
 var Parser = (function ParserClosure() {
@@ -35034,6 +35179,9 @@ var Stream = (function StreamClosure() {
     get length() {
       return this.end - this.start;
     },
+    get isEmpty() {
+      return this.length === 0;
+    },
     getByte: function Stream_getByte() {
       if (this.pos >= this.end) {
         return -1;
@@ -35127,6 +35275,12 @@ var DecodeStream = (function DecodeStreamClosure() {
   }
 
   DecodeStream.prototype = {
+    get isEmpty() {
+      while (!this.eof && this.bufferLength === 0) {
+        this.readBlock();
+      }
+      return this.bufferLength === 0;
+    },
     ensureBuffer: function DecodeStream_ensureBuffer(requested) {
       var buffer = this.buffer;
       var current;
@@ -35143,8 +35297,8 @@ var DecodeStream = (function DecodeStreamClosure() {
         size *= 2;
       }
       var buffer2 = new Uint8Array(size);
-      for (var i = 0; i < current; ++i) {
-        buffer2[i] = buffer[i];
+      if (buffer) {
+        buffer2.set(buffer);
       }
       return (this.buffer = buffer2);
     },
@@ -35212,7 +35366,7 @@ var DecodeStream = (function DecodeStreamClosure() {
       }
       return new Stream(this.buffer, start, length, dict);
     },
-    skip: function Stream_skip(n) {
+    skip: function DecodeStream_skip(n) {
       if (!n) {
         n = 1;
       }
@@ -37650,81 +37804,64 @@ var WorkerMessageHandler = PDFJS.WorkerMessageHandler = {
       }, onFailure);
     });
 
-    handler.on('GetPageRequest', function wphSetupGetPage(data) {
-      var pageIndex = data.pageIndex;
-      pdfManager.getPage(pageIndex).then(function(page) {
+    handler.on('GetPage', function wphSetupGetPage(data) {
+      return pdfManager.getPage(data.pageIndex).then(function(page) {
         var rotatePromise = pdfManager.ensure(page, 'rotate');
         var refPromise = pdfManager.ensure(page, 'ref');
         var viewPromise = pdfManager.ensure(page, 'view');
 
-        Promise.all([rotatePromise, refPromise, viewPromise]).then(
+        return Promise.all([rotatePromise, refPromise, viewPromise]).then(
             function(results) {
-          var page = {
-            pageIndex: data.pageIndex,
+          return {
             rotate: results[0],
             ref: results[1],
             view: results[2]
           };
-
-          handler.send('GetPage', { pageInfo: page });
         });
       });
     });
 
-    handler.on('GetPageIndex', function wphSetupGetPageIndex(data, deferred) {
+    handler.on('GetPageIndex', function wphSetupGetPageIndex(data) {
       var ref = new Ref(data.ref.num, data.ref.gen);
       var catalog = pdfManager.pdfDocument.catalog;
-      catalog.getPageIndex(ref).then(function (pageIndex) {
-        deferred.resolve(pageIndex);
-      }, deferred.reject);
+      return catalog.getPageIndex(ref);
     });
 
     handler.on('GetDestinations',
-      function wphSetupGetDestinations(data, deferred) {
-        pdfManager.ensureCatalog('destinations').then(function(destinations) {
-          deferred.resolve(destinations);
-        });
+      function wphSetupGetDestinations(data) {
+        return pdfManager.ensureCatalog('destinations');
       }
     );
 
     handler.on('GetAttachments',
-      function wphSetupGetAttachments(data, deferred) {
-        pdfManager.ensureCatalog('attachments').then(function(attachments) {
-          deferred.resolve(attachments);
-        }, deferred.reject);
+      function wphSetupGetAttachments(data) {
+        return pdfManager.ensureCatalog('attachments');
       }
     );
 
     handler.on('GetJavaScript',
-      function wphSetupGetJavaScript(data, deferred) {
-        pdfManager.ensureCatalog('javaScript').then(function (js) {
-          deferred.resolve(js);
-        }, deferred.reject);
+      function wphSetupGetJavaScript(data) {
+        return pdfManager.ensureCatalog('javaScript');
       }
     );
 
     handler.on('GetOutline',
-      function wphSetupGetOutline(data, deferred) {
-        pdfManager.ensureCatalog('documentOutline').then(function (outline) {
-          deferred.resolve(outline);
-        }, deferred.reject);
+      function wphSetupGetOutline(data) {
+        return pdfManager.ensureCatalog('documentOutline');
       }
     );
 
     handler.on('GetMetadata',
-      function wphSetupGetMetadata(data, deferred) {
-        Promise.all([pdfManager.ensureDoc('documentInfo'),
-                     pdfManager.ensureCatalog('metadata')]).then(
-            function (results) {
-          deferred.resolve(results);
-        }, deferred.reject);
+      function wphSetupGetMetadata(data) {
+        return Promise.all([pdfManager.ensureDoc('documentInfo'),
+                            pdfManager.ensureCatalog('metadata')]);
       }
     );
 
-    handler.on('GetData', function wphSetupGetData(data, deferred) {
+    handler.on('GetData', function wphSetupGetData(data) {
       pdfManager.requestLoadedStream();
-      pdfManager.onLoadedStream().then(function(stream) {
-        deferred.resolve(stream.bytes);
+      return pdfManager.onLoadedStream().then(function(stream) {
+        return stream.bytes;
       });
     });
 
@@ -37732,16 +37869,9 @@ var WorkerMessageHandler = PDFJS.WorkerMessageHandler = {
       pdfManager.updatePassword(data);
     });
 
-    handler.on('GetAnnotationsRequest', function wphSetupGetAnnotations(data) {
-      pdfManager.getPage(data.pageIndex).then(function(page) {
-        pdfManager.ensure(page, 'getAnnotationsData', []).then(
-          function(annotationsData) {
-            handler.send('GetAnnotations', {
-              pageIndex: data.pageIndex,
-              annotations: annotationsData
-            });
-          }
-        );
+    handler.on('GetAnnotations', function wphSetupGetAnnotations(data) {
+      return pdfManager.getPage(data.pageIndex).then(function(page) {
+        return pdfManager.ensure(page, 'getAnnotationsData', []);
       });
     });
 
@@ -37790,29 +37920,24 @@ var WorkerMessageHandler = PDFJS.WorkerMessageHandler = {
       });
     }, this);
 
-    handler.on('GetTextContent', function wphExtractText(data, deferred) {
-      pdfManager.getPage(data.pageIndex).then(function(page) {
+    handler.on('GetTextContent', function wphExtractText(data) {
+      return pdfManager.getPage(data.pageIndex).then(function(page) {
         var pageNum = data.pageIndex + 1;
         var start = Date.now();
-        page.extractTextContent().then(function(textContent) {
-          deferred.resolve(textContent);
+        return page.extractTextContent().then(function(textContent) {
           info('text indexing: page=' + pageNum + ' - time=' +
                (Date.now() - start) + 'ms');
-        }, function (e) {
-          // Skip errored pages
-          deferred.reject(e);
+          return textContent;
         });
       });
     });
 
-    handler.on('Cleanup', function wphCleanup(data, deferred) {
-      pdfManager.cleanup();
-      deferred.resolve(true);
+    handler.on('Cleanup', function wphCleanup(data) {
+      return pdfManager.cleanup();
     });
 
-    handler.on('Terminate', function wphTerminate(data, deferred) {
+    handler.on('Terminate', function wphTerminate(data) {
       pdfManager.terminate();
-      deferred.resolve();
     });
   }
 };
@@ -40915,7 +41040,7 @@ var Jbig2Image = (function Jbig2ImageClosure() {
       if (id in this) {
         return this[id];
       }
-      return (this[id] = new Int8Array(1<<16));
+      return (this[id] = new Int8Array(1 << 16));
     }
   };
 
@@ -40940,69 +41065,32 @@ var Jbig2Image = (function Jbig2ImageClosure() {
   // A.2 Procedure for decoding values
   function decodeInteger(contextCache, procedure, decoder) {
     var contexts = contextCache.getContexts(procedure);
-
     var prev = 1;
-    var state = 1, v = 0, s;
-    var toRead = 32, offset = 4436; // defaults for state 7
-    while (state) {
-      var bit = decoder.readBit(contexts, prev);
-      prev = (prev < 256 ? (prev << 1) | bit :
-              (((prev << 1) | bit) & 511) | 256);
-      switch (state) {
-        case 1:
-          s = !!bit;
-          break;
-        case 2:
-          if (bit) {
-            break;
-          }
-          state = 7;
-          toRead = 2;
-          offset = 0;
-          break;
-        case 3:
-          if (bit) {
-            break;
-          }
-          state = 7;
-          toRead = 4;
-          offset = 4;
-          break;
-        case 4:
-          if (bit) {
-            break;
-          }
-          state = 7;
-          toRead = 6;
-          offset = 20;
-          break;
-        case 5:
-          if (bit) {
-            break;
-          }
-          state = 7;
-          toRead = 8;
-          offset = 84;
-          break;
-        case 6:
-          if (bit) {
-            break;
-          }
-          state = 7;
-          toRead = 12;
-          offset = 340;
-          break;
-        default:
-          v = ((v << 1) | bit) >>> 0;
-          if (--toRead === 0) {
-            state = 0;
-          }
-          continue;
+
+    function readBits(length) {
+      var v = 0;
+      for (var i = 0; i < length; i++) {
+        var bit = decoder.readBit(contexts, prev);
+        prev = (prev < 256 ? (prev << 1) | bit :
+                (((prev << 1) | bit) & 511) | 256);
+        v = (v << 1) | bit;
       }
-      state++;
+      return v >>> 0;
     }
-    v += offset;
-    return (!s ? v : (v > 0 ? -v : null));
+
+    var sign = readBits(1);
+    var value = readBits(1) ?
+                  (readBits(1) ?
+                    (readBits(1) ?
+                      (readBits(1) ?
+                        (readBits(1) ?
+                          (readBits(32) + 4436) :
+                        readBits(12) + 340) :
+                      readBits(8) + 84) :
+                    readBits(6) + 20) :
+                  readBits(4) + 4) :
+                readBits(2);
+    return (sign === 0 ? value : (value > 0 ? -value : null));
   }
 
   // A.3 The IAID decoding procedure

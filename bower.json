@@ -1,11 +1,11 @@
 {
   "name": "pdfjs-bower",
-  "version": "1.0.194",
+  "version": "1.0.233",
   "homepage": "https://github.com/joseym/pdfjs-bower",
   "authors": [
     "Josey Morton <me@joseymorton.com>"
   ],
-  "description": "Bower build for mozilla/pdf.js since they're giving push back on it.",
+  "description": "Bower build for mozilla/pdf.js.",
   "moduleType": [
     "node"
   ],
