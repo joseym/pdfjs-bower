@@ -32,5 +32,5 @@ You can build yourself by doing the following
 > You should now see 3 files within the `dist` directory
 
 - `pdf.js`
-- `pdf.woker.js`
+- `pdf.worker.js`
 - `compatibility.js`
